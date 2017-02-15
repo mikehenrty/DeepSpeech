@@ -1,17 +1,15 @@
 import fnmatch
 import os
-import random
 import subprocess
 import tarfile
 import tensorflow as tf
 import unicodedata
 import codecs
+import pandas
 
-from glob import glob
 from itertools import cycle
 from math import ceil
 from sox import Transformer
-from Queue import PriorityQueue
 from shutil import rmtree
 from tensorflow.contrib.learn.python.learn.datasets import base
 from tensorflow.python.platform import gfile
@@ -44,7 +42,7 @@ class DataSets(object):
         return self._test
 
 class DataSet(object):
-    def __init__(self, txt_files, thread_count, batch_size, numcep, numcontext):
+    def __init__(self, filelist, thread_count, batch_size, numcep, numcontext):
         self._coord = None
         self._numcep = numcep
         self._x = tf.placeholder(tf.float32, [None, numcep + (2 * numcep * numcontext)])
@@ -56,7 +54,7 @@ class DataSet(object):
                                                   capacity=2 * self._get_device_count() * batch_size)
         self._enqueue_op = self._example_queue.enqueue([self._x, self._x_length, self._y, self._y_length])
         self._close_op = self._example_queue.close(cancel_pending_enqueues=True)
-        self._txt_files = txt_files
+        self._filelist = filelist
         self._batch_size = batch_size
         self._numcontext = numcontext
         self._thread_count = thread_count
@@ -78,26 +76,20 @@ class DataSet(object):
         session.run(self._close_op)
 
     def _create_files_circular_list(self):
-        priorityQueue = PriorityQueue()
-        for txt_file in self._txt_files:
-          wav_file = os.path.splitext(txt_file)[0] + ".wav"
-          wav_file_size = os.path.getsize(wav_file)
-          priorityQueue.put((wav_file_size, (txt_file, wav_file)))
-        files_list = []
-        while not priorityQueue.empty():
-            priority, (txt_file, wav_file) = priorityQueue.get()
-            files_list.append((txt_file, wav_file))
-        return cycle(files_list)
+        # 1. Sort by wav filesize
+        # 2. Select just wav filename and transcript columns
+        # 3. Create a cycle
+        return cycle(self._filelist.sort_values(by="wav_filesize")
+                                   .ix[:, ["wav_filename", "transcript"]]
+                                   .itertuples(index=False))
 
     def _populate_batch_queue(self, session):
-        for txt_file, wav_file in self._files_circular_list:
+        for wav_file, transcript in self._files_circular_list:
             if self._coord.should_stop():
                 return
             source = audiofile_to_input_vector(wav_file, self._numcep, self._numcontext)
             source_len = len(source)
-            with codecs.open(txt_file, encoding="utf-8") as open_txt_file:
-                target = unicodedata.normalize("NFKD", open_txt_file.read()).encode("ascii", "ignore")
-                target = text_to_char_array(target)
+            target = text_to_char_array(transcript)
             target_len = len(target)
             try:
                 session.run(self._enqueue_op, feed_dict={
@@ -115,99 +107,124 @@ class DataSet(object):
 
     @property
     def total_batches(self):
-        # Note: If len(_txt_files) % _batch_size != 0, this re-uses initial _txt_files
-        return int(ceil(float(len(self._txt_files)) /float(self._batch_size)))
+        # Note: If len(_filelist) % _batch_size != 0, this re-uses initial files
+        return int(ceil(float(len(self._filelist)) /float(self._batch_size)))
 
 
 def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, numcep, numcontext, thread_count=8, limit_dev=0, limit_test=0, limit_train=0, sets=[]):
-    # Check if we can convert FLAC with SoX before we start
-    sox_help_out = subprocess.check_output(["sox", "-h"])
-    if sox_help_out.find("flac") == -1:
-        print("Error: SoX doesn't support FLAC. Please install SoX with FLAC support and try again.")
-        exit(1)
+    # Read the processed set files from disk if they exist, otherwise create
+    # them.
+    train_files = None
+    train_csv = os.path.join(data_dir, "librivox-train.csv")
+    if gfile.Exists(train_csv):
+        train_files = pandas.read_csv(train_csv)
 
-    # Conditionally download data to data_dir
-    TRAIN_CLEAN_100_URL = "http://www.openslr.org/resources/12/train-clean-100.tar.gz"
-    TRAIN_CLEAN_360_URL = "http://www.openslr.org/resources/12/train-clean-360.tar.gz"
-    TRAIN_OTHER_500_URL = "http://www.openslr.org/resources/12/train-other-500.tar.gz"
+    dev_files = None
+    dev_csv = os.path.join(data_dir, "librivox-dev.csv")
+    if gfile.Exists(dev_csv):
+        dev_files = pandas.read_csv(dev_csv)
 
-    DEV_CLEAN_URL = "http://www.openslr.org/resources/12/dev-clean.tar.gz"
-    DEV_OTHER_URL = "http://www.openslr.org/resources/12/dev-other.tar.gz"
+    test_files = None
+    test_csv = os.path.join(data_dir, "librivox-test.csv")
+    if gfile.Exists(test_csv):
+        test_files = pandas.read_csv(test_csv)
 
-    TEST_CLEAN_URL = "http://www.openslr.org/resources/12/test-clean.tar.gz"
-    TEST_OTHER_URL = "http://www.openslr.org/resources/12/test-other.tar.gz"
+    if train_files is None or dev_files is None or test_files is None:
+        print("Processed dataset files not found, downloading and processing data...")
 
-    train_clean_100 = base.maybe_download("train-clean-100.tar.gz", data_dir, TRAIN_CLEAN_100_URL)
-    train_clean_360 = base.maybe_download("train-clean-360.tar.gz", data_dir, TRAIN_CLEAN_360_URL)
-    train_other_500 = base.maybe_download("train-other-500.tar.gz", data_dir, TRAIN_OTHER_500_URL)
+        # Check if we can convert FLAC with SoX before we start
+        sox_help_out = subprocess.check_output(["sox", "-h"])
+        if sox_help_out.find("flac") == -1:
+            print("Error: SoX doesn't support FLAC. Please install SoX with FLAC support and try again.")
+            exit(1)
 
-    dev_clean = base.maybe_download("dev-clean.tar.gz", data_dir, DEV_CLEAN_URL)
-    dev_other = base.maybe_download("dev-other.tar.gz", data_dir, DEV_OTHER_URL)
+        # Conditionally download data to data_dir
+        TRAIN_CLEAN_100_URL = "http://www.openslr.org/resources/12/train-clean-100.tar.gz"
+        TRAIN_CLEAN_360_URL = "http://www.openslr.org/resources/12/train-clean-360.tar.gz"
+        TRAIN_OTHER_500_URL = "http://www.openslr.org/resources/12/train-other-500.tar.gz"
 
-    test_clean = base.maybe_download("test-clean.tar.gz", data_dir, TEST_CLEAN_URL)
-    test_other = base.maybe_download("test-other.tar.gz", data_dir, TEST_OTHER_URL)
+        DEV_CLEAN_URL = "http://www.openslr.org/resources/12/dev-clean.tar.gz"
+        DEV_OTHER_URL = "http://www.openslr.org/resources/12/dev-other.tar.gz"
 
-    # Conditionally extract LibriSpeech data
-    # We extract each archive into data_dir, but test for existence in
-    # data_dir/LibriSpeech because the archives share that root.
-    LIBRIVOX_DIR = "LibriSpeech"
-    work_dir = os.path.join(data_dir, LIBRIVOX_DIR)
+        TEST_CLEAN_URL = "http://www.openslr.org/resources/12/test-clean.tar.gz"
+        TEST_OTHER_URL = "http://www.openslr.org/resources/12/test-other.tar.gz"
 
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "train-clean-100"), train_clean_100)
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "train-clean-360"), train_clean_360)
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "train-other-500"), train_other_500)
+        train_clean_100 = base.maybe_download("train-clean-100.tar.gz", data_dir, TRAIN_CLEAN_100_URL)
+        train_clean_360 = base.maybe_download("train-clean-360.tar.gz", data_dir, TRAIN_CLEAN_360_URL)
+        train_other_500 = base.maybe_download("train-other-500.tar.gz", data_dir, TRAIN_OTHER_500_URL)
 
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "dev-clean"), dev_clean)
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "dev-other"), dev_other)
+        dev_clean = base.maybe_download("dev-clean.tar.gz", data_dir, DEV_CLEAN_URL)
+        dev_other = base.maybe_download("dev-other.tar.gz", data_dir, DEV_OTHER_URL)
 
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "test-clean"), test_clean)
-    _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "test-other"), test_other)
+        test_clean = base.maybe_download("test-clean.tar.gz", data_dir, TEST_CLEAN_URL)
+        test_other = base.maybe_download("test-other.tar.gz", data_dir, TEST_OTHER_URL)
 
-    # Conditionally convert FLAC data to wav, from:
-    #  data_dir/LibriSpeech/split/1/2/1-2-3.flac
-    # to:
-    #  data_dir/LibriSpeech/split-wav/1-2-3.wav
-    _maybe_convert_wav(work_dir, "train-clean-100", "train-clean-100-wav")
-    _maybe_convert_wav(work_dir, "train-clean-360", "train-clean-360-wav")
-    _maybe_convert_wav(work_dir, "train-other-500", "train-other-500-wav")
+        # Conditionally extract LibriSpeech data
+        # We extract each archive into data_dir, but test for existence in
+        # data_dir/LibriSpeech because the archives share that root.
+        LIBRIVOX_DIR = "LibriSpeech"
+        work_dir = os.path.join(data_dir, LIBRIVOX_DIR)
 
-    _maybe_convert_wav(work_dir, "dev-clean", "dev-clean-wav")
-    _maybe_convert_wav(work_dir, "dev-other", "dev-other-wav")
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "train-clean-100"), train_clean_100)
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "train-clean-360"), train_clean_360)
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "train-other-500"), train_other_500)
 
-    _maybe_convert_wav(work_dir, "test-clean", "test-clean-wav")
-    _maybe_convert_wav(work_dir, "test-other", "test-other-wav")
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "dev-clean"), dev_clean)
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "dev-other"), dev_other)
 
-    # Conditionally split LibriSpeech transcriptions, from:
-    #  data_dir/LibriSpeech/split/1/2/1-2.trans.txt
-    # to:
-    #  data_dir/LibriSpeech/split-wav/1-2-0.txt
-    #  data_dir/LibriSpeech/split-wav/1-2-1.txt
-    #  data_dir/LibriSpeech/split-wav/1-2-2.txt
-    #  ...
-    _maybe_split_transcriptions(work_dir, "train-clean-100", "train-clean-100-wav")
-    _maybe_split_transcriptions(work_dir, "train-clean-360", "train-clean-360-wav")
-    _maybe_split_transcriptions(work_dir, "train-other-500", "train-other-500-wav")
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "test-clean"), test_clean)
+        _maybe_extract(data_dir, os.path.join(LIBRIVOX_DIR, "test-other"), test_other)
 
-    _maybe_split_transcriptions(work_dir, "dev-clean", "dev-clean-wav")
-    _maybe_split_transcriptions(work_dir, "dev-other", "dev-other-wav")
+        # Conditionally convert FLAC data to wav, from:
+        #  data_dir/LibriSpeech/split/1/2/1-2-3.flac
+        # to:
+        #  data_dir/LibriSpeech/split-wav/1-2-3.wav
+        _maybe_convert_wav(work_dir, "train-clean-100", "train-clean-100-wav")
+        _maybe_convert_wav(work_dir, "train-clean-360", "train-clean-360-wav")
+        _maybe_convert_wav(work_dir, "train-other-500", "train-other-500-wav")
 
-    _maybe_split_transcriptions(work_dir, "test-clean", "test-clean-wav")
-    _maybe_split_transcriptions(work_dir, "test-other", "test-other-wav")
+        _maybe_convert_wav(work_dir, "dev-clean", "dev-clean-wav")
+        _maybe_convert_wav(work_dir, "dev-other", "dev-other-wav")
+
+        _maybe_convert_wav(work_dir, "test-clean", "test-clean-wav")
+        _maybe_convert_wav(work_dir, "test-other", "test-other-wav")
+
+        # Conditionally split LibriSpeech transcriptions, from:
+        #  data_dir/LibriSpeech/split/1/2/1-2.trans.txt
+        # to:
+        #  data_dir/LibriSpeech/split-wav/1-2-0.txt
+        #  data_dir/LibriSpeech/split-wav/1-2-1.txt
+        #  data_dir/LibriSpeech/split-wav/1-2-2.txt
+        #  ...
+        train_files = _maybe_split_transcriptions(work_dir, "train-clean-100", "train-clean-100-wav")
+        train_files.append(_maybe_split_transcriptions(work_dir, "train-clean-360", "train-clean-360-wav"))
+        train_files.append(_maybe_split_transcriptions(work_dir, "train-other-500", "train-other-500-wav"))
+
+        dev_files = _maybe_split_transcriptions(work_dir, "dev-clean", "dev-clean-wav")
+        dev_files.append(_maybe_split_transcriptions(work_dir, "dev-other", "dev-other-wav"))
+
+        test_files = _maybe_split_transcriptions(work_dir, "test-clean", "test-clean-wav")
+        test_files.append(_maybe_split_transcriptions(work_dir, "test-other", "test-other-wav"))
+
+        # Write processed sets to disk as CSV files
+        train_files.to_csv(train_csv, index=False)
+        dev_files.to_csv(dev_csv, index=False)
+        test_files.to_csv(test_csv, index=False)
 
     # Create train DataSet from all the train archives
     train = None
     if "train" in sets:
-        train = _read_data_set(work_dir, "train-*-wav", thread_count, train_batch_size, numcep, numcontext, limit=limit_train)
+        train = _read_data_set(train_files, thread_count, train_batch_size, numcep, numcontext, limit=limit_train)
 
     # Create dev DataSet from all the dev archives
     dev = None
     if "dev" in sets:
-        dev = _read_data_set(work_dir, "dev-*-wav", thread_count, dev_batch_size, numcep, numcontext, limit=limit_dev)
+        dev = _read_data_set(dev_files, thread_count, dev_batch_size, numcep, numcontext, limit=limit_dev)
 
     # Create test DataSet from all the test archives
     test = None
     if "test" in sets:
-        test = _read_data_set(work_dir, "test-*-wav", thread_count, test_batch_size, numcep, numcontext, limit=limit_test)
+        test = _read_data_set(test_files, thread_count, test_batch_size, numcep, numcontext, limit=limit_test)
 
     # Return DataSets
     return DataSets(train, dev, test)
@@ -257,22 +274,26 @@ def _maybe_split_transcriptions(extracted_dir, data_set, dest_dir):
     for root, dirnames, filenames in os.walk(source_dir):
         for filename in fnmatch.filter(filenames, '*.trans.txt'):
             trans_filename = os.path.join(root, filename)
-            with open(trans_filename, "r") as fin:
+            with codecs.open(txt_file, "r", encoding="utf-8") as fin:
                 for line in fin:
                     first_space = line.find(" ")
                     txt_file = line[:first_space] + ".txt"
-                    with open(os.path.join(target_dir, txt_file), "w") as fout:
-                        fout.write(line[first_space+1:].lower().strip("\n"))
+                    wav_file = line[:first_space] + ".wav"
+                    wav_file = os.path.join(target_dir, wav_file)
+                    wav_filesize = os.path.getsize(wav_file)
+                    transcript = line[first_space+1:].lower.strip("\n")
+                    transcript = unicodedata.normalize("NFKD", transcript).encode("ascii", "ignore")
+
+                    files.append((wav_file, wav_filesize, transcript))
             os.remove(trans_filename)
 
-def _read_data_set(work_dir, data_set, thread_count, batch_size, numcep, numcontext, limit=0):
-    # Create data set dir
-    dataset_dir = os.path.join(work_dir, data_set)
+    return pandas.DataFrame(data=files,
+                            columns=["wav_filename", "wav_filesize", "transcript"])
 
-    # Obtain list of txt files
-    txt_files = glob(os.path.join(dataset_dir, "*.txt"))
+def _read_data_set(filelist, thread_count, batch_size, numcep, numcontext, limit=0):
+    # Optionally apply dataset size limit
     if limit > 0:
-        txt_files = txt_files[:limit]
+        filelist = filelist.iloc[:limit]
 
     # Return DataSet
-    return DataSet(txt_files, thread_count, batch_size, numcep, numcontext)
+    return DataSet(filelist, thread_count, batch_size, numcep, numcontext)
