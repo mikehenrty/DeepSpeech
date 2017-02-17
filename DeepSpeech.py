@@ -167,6 +167,9 @@ for var in ['b1', 'h1', 'b2', 'h2', 'b3', 'h3', 'b5', 'h5', 'b6', 'h6']:
 # Standard session configuration that'll be used for all new sessions.
 session_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=log_device_placement)
 
+# Turn on XLA JIT
+session_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
+
 
 # Geometric Constants
 # ===================
