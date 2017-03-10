@@ -16,6 +16,7 @@ from collections import OrderedDict
 from math import ceil
 from tensorflow.contrib.session_bundle import exporter
 from tensorflow.python.tools import freeze_graph
+from util.bngru import BNGRUCell
 from util.gpu import get_available_gpus
 from util.log import merge_logs
 from util.spell import correction
@@ -156,6 +157,18 @@ log_variables = bool(len(os.environ.get('ds_log_variables', '')))
 # The layer width to use when initialising layers
 n_hidden = int(os.environ.get('ds_n_hidden', 2048))
 
+# The decay that's used in the batch normalization layers
+decay = float(os.environ.get('ds_decay', 0.99))
+
+# The size of the convolution kernels
+kernel_size = int(os.environ.get('ds_conv_kernel_size', 11))
+
+# The stride of the convolution kernels
+stride = int(os.environ.get('ds_stride', 2))
+
+# The number of recurrent layers
+n_recurrent_layers = int(os.environ.get('ds_n_recurrent_layers', 5))
+
 
 # Initialization
 
@@ -208,117 +221,70 @@ n_hidden_6 = n_character
 # Graph Creation
 # ==============
 
-def variable_on_cpu(name, shape, initializer):
-    r"""
-    Next we concern ourselves with graph creation.
-    However, before we do so we must introduce a utility function ``variable_on_cpu()``
-    used to create a variable in CPU memory.
+def conv_output_length(input_length, filter_size, padding, stride,
+                       dilation=1):
+    """ Compute the length of the output sequence after 1D convolution along
+        time.
+    Params:
+        input_length (int): Length of the input sequence.
+        filter_size (int): Width of the convolution kernel.
+        padding (str): Only support `SAME` or `VALID`.
+        stride (int): Stride size used in 1D convolution.
+        dilation (int)
     """
-    # Use the /cpu:0 device for scoped operations
-    with tf.device('/cpu:0'):
-        # Create or get apropos variable
-        var = tf.get_variable(name=name, shape=shape, initializer=initializer)
-    return var
+    if input_length is None:
+        return None
+    assert padding in {'SAME', 'VALID'}
+    dilated_filter_size = filter_size + (filter_size - 1) * (dilation - 1)
+    if padding == 'SAME':
+        output_length = input_length
+    elif padding == 'VALID':
+        output_length = input_length - dilated_filter_size + 1
+    return (output_length + stride - 1) // stride
 
+def BiRNN(batch_x, seq_length, dropout, is_training, reuse):
+    # Input shape: [batch_size, n_steps, n_input]
+    with tf.contrib.slim.arg_scope([tf.contrib.slim.model_variable, tf.contrib.slim.variable], device="/cpu:0"):
+        # One layer of 1D convolution with SAME padding
+        with tf.variable_scope("conv1d") as scope:
+            layer_1 = tf.contrib.layers.convolution2d(
+                inputs=batch_x,
+                num_outputs=n_hidden,
+                kernel_size=[kernel_size],
+                stride=stride,
+                padding="SAME",
+                normalizer_fn=tf.contrib.layers.batch_norm,
+                normalizer_params={"is_training": is_training},
+                scope=scope,
+                reuse=reuse)
 
-def BiRNN(batch_x, seq_length, dropout):
-    r"""
-    That done, we will define the learned variables, the weights and biases,
-    within the method ``BiRNN()`` which also constructs the neural network.
-    The variables named ``hn``, where ``n`` is an integer, hold the learned weight variables.
-    The variables named ``bn``, where ``n`` is an integer, hold the learned bias variables.
-    In particular, the first variable ``h1`` holds the learned weight matrix that
-    converts an input vector of dimension ``n_input + 2*n_input*n_context``
-    to a vector of dimension ``n_hidden_1``.
-    Similarly, the second variable ``h2`` holds the weight matrix converting
-    an input vector of dimension ``n_hidden_1`` to one of dimension ``n_hidden_2``.
-    The variables ``h3``, ``h5``, and ``h6`` are similar.
-    Likewise, the biases, ``b1``, ``b2``..., hold the biases for the various layers.
-    """
-    # Input shape: [batch_size, n_steps, n_input + 2*n_input*n_context]
-    batch_x_shape = tf.shape(batch_x)
+        output_lengths = conv_output_length(seq_length, kernel_size, "SAME", stride)
 
-    # Reshaping `batch_x` to a tensor with shape `[n_steps*batch_size, n_input + 2*n_input*n_context]`.
-    # This is done to prepare the batch for input into the first layer which expects a tensor of rank `2`.
+        # Store individual statistics for a max of 10 seconds worth of time steps
+        # 10 seconds * (1/0.01) time steps per second = 1000 time steps
+        max_bn_steps = 1000
+        # Three layers of GRU cells with 1024 nodes each
+        cell = BNGRUCell(n_hidden, is_training, max_bn_steps=max_bn_steps, decay=0.9)
+        multi_cell = tf.contrib.rnn.MultiRNNCell([cell] * n_recurrent_layers)
+        rnn_outputs, _ = tf.nn.dynamic_rnn(cell=multi_cell,
+                                           inputs=layer_1,
+                                           sequence_length=output_lengths,
+                                           dtype=tf.float32)
 
-    # Permute n_steps and batch_size
-    batch_x = tf.transpose(batch_x, [1, 0, 2])
-    # Reshape to prepare input for first layer
-    batch_x = tf.reshape(batch_x, [-1, n_input + 2*n_input*n_context]) # (n_steps*batch_size, n_input + 2*n_input*n_context)
+        # A final fully connected layer with linear activation
+        with tf.variable_scope("fc") as scope:
+            network_output = tf.contrib.layers.fully_connected(
+                inputs=rnn_outputs,
+                num_outputs=n_character,
+                activation_fn=None,
+                scope=scope,
+                reuse=reuse)
 
-    # The next three blocks will pass `batch_x` through three hidden layers with
-    # clipped RELU activation and dropout.
+        # Transpose to time major
+        network_output = tf.transpose(network_output, [1, 0, 2])
 
-    # 1st layer
-    b1 = variable_on_cpu('b1', [n_hidden_1], tf.random_normal_initializer(stddev=b1_stddev))
-    h1 = variable_on_cpu('h1', [n_input + 2*n_input*n_context, n_hidden_1], tf.random_normal_initializer(stddev=h1_stddev))
-    layer_1 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(batch_x, h1), b1)), relu_clip)
-    layer_1 = tf.nn.dropout(layer_1, (1.0 - dropout[0]))
-
-    # 2nd layer
-    b2 = variable_on_cpu('b2', [n_hidden_2], tf.random_normal_initializer(stddev=b2_stddev))
-    h2 = variable_on_cpu('h2', [n_hidden_1, n_hidden_2], tf.random_normal_initializer(stddev=h2_stddev))
-    layer_2 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_1, h2), b2)), relu_clip)
-    layer_2 = tf.nn.dropout(layer_2, (1.0 - dropout[1]))
-
-    # 3rd layer
-    b3 = variable_on_cpu('b3', [n_hidden_3], tf.random_normal_initializer(stddev=b3_stddev))
-    h3 = variable_on_cpu('h3', [n_hidden_2, n_hidden_3], tf.random_normal_initializer(stddev=h3_stddev))
-    layer_3 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(layer_2, h3), b3)), relu_clip)
-    layer_3 = tf.nn.dropout(layer_3, (1.0 - dropout[2]))
-
-    # Now we create the forward and backward LSTM units.
-    # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
-
-    # Forward direction cell:
-    lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
-    lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
-                                                 input_keep_prob=1.0 - dropout[3],
-                                                 output_keep_prob=1.0 - dropout[3],
-                                                 seed=random_seed)
-    # Backward direction cell:
-    lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
-    lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
-                                                 input_keep_prob=1.0 - dropout[4],
-                                                 output_keep_prob=1.0 - dropout[4],
-                                                 seed=random_seed)
-
-    # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
-    # as the LSTM BRNN expects its input to be of shape `[max_time, batch_size, input_size]`.
-    layer_3 = tf.reshape(layer_3, [-1, batch_x_shape[0], n_hidden_3])
-
-    # Now we feed `layer_3` into the LSTM BRNN cell and obtain the LSTM BRNN output.
-    outputs, output_states = tf.nn.bidirectional_dynamic_rnn(cell_fw=lstm_fw_cell,
-                                                             cell_bw=lstm_bw_cell,
-                                                             inputs=layer_3,
-                                                             dtype=tf.float32,
-                                                             time_major=True,
-                                                             sequence_length=seq_length)
-
-    # Reshape outputs from two tensors each of shape [n_steps, batch_size, n_cell_dim]
-    # to a single tensor of shape [n_steps*batch_size, 2*n_cell_dim]
-    outputs = tf.concat(outputs, 2)
-    outputs = tf.reshape(outputs, [-1, 2*n_cell_dim])
-
-    # Now we feed `outputs` to the fifth hidden layer with clipped RELU activation and dropout
-    b5 = variable_on_cpu('b5', [n_hidden_5], tf.random_normal_initializer(stddev=b5_stddev))
-    h5 = variable_on_cpu('h5', [(2 * n_cell_dim), n_hidden_5], tf.random_normal_initializer(stddev=h5_stddev))
-    layer_5 = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, h5), b5)), relu_clip)
-    layer_5 = tf.nn.dropout(layer_5, (1.0 - dropout[5]))
-
-    # Now we apply the weight matrix `h6` and bias `b6` to the output of `layer_5`
-    # creating `n_classes` dimensional vectors, the logits.
-    b6 = variable_on_cpu('b6', [n_hidden_6], tf.random_normal_initializer(stddev=b6_stddev))
-    h6 = variable_on_cpu('h6', [n_hidden_5, n_hidden_6], tf.random_normal_initializer(stddev=h6_stddev))
-    layer_6 = tf.add(tf.matmul(layer_5, h6), b6)
-
-    # Finally we reshape layer_6 from a tensor of shape [n_steps*batch_size, n_hidden_6]
-    # to the slightly more useful shape [n_steps, batch_size, n_hidden_6].
-    # Note, that this differs from the input in that it is time-major.
-    layer_6 = tf.reshape(layer_6, [-1, batch_x_shape[0], n_hidden_6])
-
-    # Output shape: [n_steps, batch_size, n_hidden_6]
-    return layer_6
+    # Output shape: [n_steps, batch_size, n_output]
+    return network_output, tf.cast(output_lengths, tf.int32)
 
 
 # Accuracy and Loss
@@ -331,7 +297,7 @@ def BiRNN(batch_x, seq_length, dropout):
 # Conveniently, this loss function is implemented in TensorFlow.
 # Thus, we can simply make use of this implementation to define our loss.
 
-def calculate_accuracy_and_loss(batch_set, dropout):
+def calculate_accuracy_and_loss(batch_set, dropout, is_training, reuse):
     r"""
     This routine beam search decodes a mini-batch and calculates the loss and accuracy.
     Next to total and average loss it returns the accuracy,
@@ -341,19 +307,19 @@ def calculate_accuracy_and_loss(batch_set, dropout):
     batch_x, batch_seq_len, batch_y = batch_set.next_batch()
 
     # Calculate the logits of the batch using BiRNN
-    logits = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout)
+    logits, out_lengths = BiRNN(batch_x, tf.to_int64(batch_seq_len), dropout, is_training, reuse)
 
     # Compute the CTC loss using either TensorFlow's `ctc_loss` or Baidu's `warp_ctc_loss`.
     if use_warpctc:
-        total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
+        total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=out_lengths)
     else:
-        total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
+        total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=out_lengths)
 
     # Calculate the average loss across the batch
     avg_loss = tf.reduce_mean(total_loss)
 
     # Beam search decode the batch
-    decoded, _ = tf.nn.ctc_beam_search_decoder(logits, batch_seq_len, merge_repeated=False)
+    decoded, _ = tf.nn.ctc_beam_search_decoder(logits, out_lengths, merge_repeated=False)
 
     # Compute the edit (Levenshtein) distance
     distance = tf.edit_distance(tf.cast(decoded[0], tf.int32), batch_y)
@@ -413,7 +379,7 @@ if 0 == len(available_devices):
     available_devices = ['/cpu:0']
 
 
-def get_tower_results(batch_set, optimizer=None):
+def get_tower_results(batch_set, optimizer, is_training):
     r"""
     With this preliminary step out of the way, we can for each GPU introduce a
     tower for which's batch we calculate
@@ -465,7 +431,7 @@ def get_tower_results(batch_set, optimizer=None):
                     # Calculate the avg_loss and accuracy and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
                     total_loss, avg_loss, distance, accuracy, decoded, labels = \
-                        calculate_accuracy_and_loss(batch_set, no_dropout if optimizer is None else dropout_rates)
+                        calculate_accuracy_and_loss(batch_set, no_dropout if optimizer is None else dropout_rates, is_training, i > 0)
 
                     # Allow for variables to be re-used by the next tower
                     tf.get_variable_scope().reuse_variables()
@@ -786,7 +752,7 @@ def create_execution_context(set_name):
         optimizer = create_optimizer() if is_train else None
 
         # Get the data_set specific graph end-points
-        tower_results = get_tower_results(data_set, optimizer=optimizer)
+        tower_results = get_tower_results(data_set, optimizer=optimizer, is_training=tf.placeholder(tf.bool, name="is_training"))
 
         if is_train:
             # Average tower gradients
@@ -923,6 +889,8 @@ def calculate_loss_and_report(execution_context, session, epoch=-1, query_report
         if log_variables:
             params['merged'] = merged
 
+        params['update_ops'] = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
+
     # Requirements to display a WER report
     if query_report:
         # Reset accuracy
@@ -945,7 +913,7 @@ def calculate_loss_and_report(execution_context, session, epoch=-1, query_report
             extra_params['run_metadata'] = loss_run_metadata
 
         # Compute the batch
-        result = session.run(params, **extra_params)
+        result = session.run(params, feed_dict={"is_training:0": do_training}, **extra_params)
 
         # Add batch to loss
         total_loss += result[param_idx['avg_loss']]
