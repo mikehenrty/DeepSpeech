@@ -15,8 +15,6 @@ import time
 from collections import OrderedDict
 from math import ceil
 from tensorflow.contrib.session_bundle import exporter
-from tensorflow.python.ops import ctc_ops
-from tensorflow.contrib.rnn.python.ops import core_rnn_cell
 from tensorflow.python.tools import freeze_graph
 from util.gpu import get_available_gpus
 from util.log import merge_logs
@@ -45,7 +43,7 @@ if do_fulltrace:
 # The number of iterations (epochs) we will train for
 epochs = int(os.environ.get('ds_epochs', 75))
 
-# Weather to use GPU bound Warp-CTC
+# Whether to use GPU bound Warp-CTC
 use_warpctc = bool(len(os.environ.get('ds_use_warpctc', '')))
 
 # As we will employ dropout on the feedforward layers of the network,
@@ -153,6 +151,12 @@ log_device_placement = bool(int(os.environ.get('ds_log_device_placement', 0)))
 log_variables = bool(len(os.environ.get('ds_log_variables', '')))
 
 
+# Geometry
+
+# The layer width to use when initialising layers
+n_hidden = int(os.environ.get('ds_n_hidden', 2048))
+
+
 # Initialization
 
 # The default random seed that is used to initialize variables. Ensures reproducibility.
@@ -184,12 +188,12 @@ n_input = 26 # TODO: Determine this programatically from the sample rate
 n_context = 9 # TODO: Determine the optimal value using a validation data set
 
 # Number of units in hidden layers
-n_hidden_1 = 2048
-n_hidden_2 = 2048
-n_hidden_5 = 2048
+n_hidden_1 = n_hidden
+n_hidden_2 = n_hidden
+n_hidden_5 = n_hidden
 
 # LSTM cell state dimension
-n_cell_dim = 2048
+n_cell_dim = n_hidden
 
 # The number of units in the third layer, which feeds in to the LSTM
 n_hidden_3 = 2 * n_cell_dim
@@ -267,17 +271,17 @@ def BiRNN(batch_x, seq_length, dropout):
     # Both of which have inputs of length `n_cell_dim` and bias `1.0` for the forget gate of the LSTM.
 
     # Forward direction cell:
-    lstm_fw_cell = core_rnn_cell.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
-    lstm_fw_cell = core_rnn_cell.DropoutWrapper(lstm_fw_cell,
-                                                input_keep_prob=1.0 - dropout[3],
-                                                output_keep_prob=1.0 - dropout[3],
-                                                seed=random_seed)
+    lstm_fw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
+    lstm_fw_cell = tf.contrib.rnn.DropoutWrapper(lstm_fw_cell,
+                                                 input_keep_prob=1.0 - dropout[3],
+                                                 output_keep_prob=1.0 - dropout[3],
+                                                 seed=random_seed)
     # Backward direction cell:
-    lstm_bw_cell = core_rnn_cell.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
-    lstm_bw_cell = core_rnn_cell.DropoutWrapper(lstm_bw_cell,
-                                                input_keep_prob=1.0 - dropout[4],
-                                                output_keep_prob=1.0 - dropout[4],
-                                                seed=random_seed)
+    lstm_bw_cell = tf.contrib.rnn.BasicLSTMCell(n_cell_dim, forget_bias=1.0, state_is_tuple=True)
+    lstm_bw_cell = tf.contrib.rnn.DropoutWrapper(lstm_bw_cell,
+                                                 input_keep_prob=1.0 - dropout[4],
+                                                 output_keep_prob=1.0 - dropout[4],
+                                                 seed=random_seed)
 
     # `layer_3` is now reshaped into `[n_steps, batch_size, 2*n_cell_dim]`,
     # as the LSTM BRNN expects its input to be of shape `[max_time, batch_size, input_size]`.
@@ -343,13 +347,13 @@ def calculate_accuracy_and_loss(batch_set, dropout):
     if use_warpctc:
         total_loss = tf.contrib.warpctc.warp_ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
     else:
-        total_loss = ctc_ops.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
+        total_loss = tf.nn.ctc_loss(labels=batch_y, inputs=logits, sequence_length=batch_seq_len)
 
     # Calculate the average loss across the batch
     avg_loss = tf.reduce_mean(total_loss)
 
     # Beam search decode the batch
-    decoded, _ = ctc_ops.ctc_beam_search_decoder(logits, batch_seq_len, merge_repeated=False)
+    decoded, _ = tf.nn.ctc_beam_search_decoder(logits, batch_seq_len, merge_repeated=False)
 
     # Compute the edit (Levenshtein) distance
     distance = tf.edit_distance(tf.cast(decoded[0], tf.int32), batch_y)
@@ -1040,6 +1044,7 @@ def train():
     dev_wer = 0.0
 
     hibernation_path = None
+    execution_context_running = False
 
     # Possibly restore checkpoint
     start_epoch = 0
@@ -1060,6 +1065,8 @@ def train():
             if hibernation_path is not None:
                 print "Resuming training session from", "%s" % hibernation_path, "..."
             session, coord, managed_threads = start_execution_context(train_context, hibernation_path)
+            # Flag that execution context has started
+            execution_context_running = True
         # The next loop should not load the model, unless it got set again in the meantime (by validation)
         hibernation_path = None
 
@@ -1095,6 +1102,8 @@ def train():
             checkpoint_path = os.path.join(checkpoint_dir, 'model.ckpt')
             # If the hibernation_path is set, the next epoch loop will load the model
             hibernation_path = stop_execution_context(train_context, session, coord, managed_threads, checkpoint_path=checkpoint_path, global_step=epoch)
+            # Flag that execution context has stoped
+            execution_context_running = False
 
             # Validating the model in a fresh session
             print "Validating model..."
@@ -1112,7 +1121,7 @@ def train():
         print
 
     # If the last iteration step was no validation, we still have to save the model
-    if hibernation_path is None:
+    if hibernation_path is None or execution_context_running:
         hibernation_path = stop_execution_context(train_context, session, coord, managed_threads, checkpoint_path=checkpoint_path, global_step=epoch)
 
     # Indicate optimization has concluded
@@ -1169,7 +1178,7 @@ if __name__ == "__main__":
             logits = BiRNN(input_tensor, tf.to_int64(seq_length), no_dropout)
 
             # Beam search decode the batch
-            decoded, _ = ctc_ops.ctc_beam_search_decoder(logits, seq_length, merge_repeated=False)
+            decoded, _ = tf.nn.ctc_beam_search_decoder(logits, seq_length, merge_repeated=False)
             decoded = tf.convert_to_tensor(
                 [tf.sparse_tensor_to_dense(sparse_tensor) for sparse_tensor in decoded], name='output_node')
 
