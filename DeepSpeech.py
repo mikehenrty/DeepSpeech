@@ -151,6 +151,12 @@ log_device_placement = bool(int(os.environ.get('ds_log_device_placement', 0)))
 log_variables = bool(len(os.environ.get('ds_log_variables', '')))
 
 
+# Geometry
+
+# The layer width to use when initialising layers
+n_hidden = int(os.environ.get('ds_n_hidden', 2048))
+
+
 # Initialization
 
 # The default random seed that is used to initialize variables. Ensures reproducibility.
@@ -182,12 +188,12 @@ n_input = 26 # TODO: Determine this programatically from the sample rate
 n_context = 9 # TODO: Determine the optimal value using a validation data set
 
 # Number of units in hidden layers
-n_hidden_1 = 2048
-n_hidden_2 = 2048
-n_hidden_5 = 2048
+n_hidden_1 = n_hidden
+n_hidden_2 = n_hidden
+n_hidden_5 = n_hidden
 
 # LSTM cell state dimension
-n_cell_dim = 2048
+n_cell_dim = n_hidden
 
 # The number of units in the third layer, which feeds in to the LSTM
 n_hidden_3 = 2 * n_cell_dim
@@ -695,6 +701,8 @@ def stopwatch(start_duration=0):
 
 def format_duration(duration):
     """Formats the result of an even stopwatch call as hours:minutes:seconds"""
+    if type(duration) is not datetime.timedelta:
+        return "N/A"
     m, s = divmod(duration.seconds, 60)
     h, m = divmod(m, 60)
     return "%d:%02d:%02d" % (h, m, s)
@@ -1041,11 +1049,13 @@ def train():
     # Possibly restore checkpoint
     start_epoch = 0
     if restore_checkpoint:
+        # Restore checkpoint created after epoch N, restart from epoch N+1
         checkpoint = tf.train.get_checkpoint_state(checkpoint_dir)
         if checkpoint and checkpoint.model_checkpoint_path:
             hibernation_path = checkpoint.model_checkpoint_path
-            start_epoch = int(checkpoint.model_checkpoint_path.split('-')[-1])
-            print 'Resuming training from epoch %d' % (start_epoch + 1)
+            last_epoch = int(checkpoint.model_checkpoint_path.split('-')[-1])
+            start_epoch = last_epoch+1
+            print 'Resuming training from epoch %d' % (start_epoch)
 
     # Loop over the data set for training_epochs epochs
     for epoch in range(start_epoch, epochs):
