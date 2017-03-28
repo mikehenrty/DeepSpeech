@@ -1121,7 +1121,7 @@ def train():
         print
 
     # If the last iteration step was no validation, we still have to save the model
-    if hibernation_path is None or execution_context_running:
+    if (epochs != 0 ) and (hibernation_path is None or execution_context_running):
         hibernation_path = stop_execution_context(train_context, session, coord, managed_threads, checkpoint_path=checkpoint_path, global_step=epoch)
 
     # Indicate optimization has concluded
