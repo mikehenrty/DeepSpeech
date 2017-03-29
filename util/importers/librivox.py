@@ -249,7 +249,7 @@ def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, 
     # Create test DataSet from all the test archives
     test = None
     if "test" in sets:
-        test = _read_data_set(work_dir, "test-*-wav", thread_count, test_batch_size, numcep, numcontext,
+        test = _read_data_set(work_dir, "test-clean-wav", thread_count, test_batch_size, numcep, numcontext,
                               limit=limit_test)
 
     # Return DataSets

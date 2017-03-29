@@ -1085,6 +1085,7 @@ def train():
         global_train_time = stopwatch(global_train_time)
         train_time = stopwatch(train_time)
 
+        print result
         result = print_report("Training", result)
         # If there was a WER calculated, we keep it
         if result is not None:

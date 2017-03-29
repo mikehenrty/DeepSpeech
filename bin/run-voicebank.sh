@@ -2,7 +2,12 @@
 
 set -xe
 
-export ds_importer="ldc93s1"
+export ds_dataroot="/data"
+#export ds_importer="fisher"
+export ds_dataset_path="${ds_dataroot}/OpenSLR/"
+
+
+export ds_importer="librivox"
 export ds_restore_checkpoint=1
 export ds_checkpoint_dir="/home/anatal/deepspeech.librivox"
 

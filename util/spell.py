@@ -37,15 +37,21 @@ def known_words(words):
     "The subset of `words` that appear in the dictionary of WORDS."
     return set(w for w in words if w in WORDS)
 
+#def split_words(word):
+#    return [word[:i] + ' ' + word[i:] for i in range(1, len(word) if known_words(word[:i]) and known_words(word[i:])]
+#
+#    if splits === known_words
+
 def edits1(word):
     "All edits that are one edit away from `word`."
     letters    = 'abcdefghijklmnopqrstuvwxyz'
     splits     = [(word[:i], word[i:])    for i in range(len(word) + 1)]
+    multi      = [L + ' ' + R             for L, R in splits if L and R]
     deletes    = [L + R[1:]               for L, R in splits if R]
     transposes = [L + R[1] + R[0] + R[2:] for L, R in splits if len(R)>1]
     replaces   = [L + c + R[1:]           for L, R in splits if R for c in letters]
     inserts    = [L + c + R               for L, R in splits for c in letters]
-    return set(deletes + transposes + replaces + inserts)
+    return set(multi + deletes + transposes + replaces + inserts)
 
 def edits2(word):
     "All edits that are two edits away from `word`."

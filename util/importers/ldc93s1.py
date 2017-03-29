@@ -71,8 +71,11 @@ class DataSet(object):
 
         audio_waves = audiofile_to_input_vector(wav_file, self._numcep, self._numcontext)
 
+        import pprint
         with open(txt_file) as open_txt_file:
-            original = ' '.join(open_txt_file.read().strip().lower().split(' ')[2:]).replace('.', '')
+            pprint.pprint(open_txt_file)
+            original = open_txt_file.read().strip().lower().replace('.', '')
+            pprint.pprint(original)
 
         target = text_to_char_array(original)
 

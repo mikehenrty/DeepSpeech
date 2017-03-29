@@ -136,9 +136,9 @@ def read_data_sets(data_dir, train_batch_size, dev_batch_size, test_batch_size, 
     # the audio source. The result is that we end up with more labels than time
     # slices, which breaks CTC. We fix this directly since it's a single occurrence
     # in the entire corpus.
-    problematic_file = os.path.join(data_dir, "fisher-2004-split-wav-sets", "train", "fe_03_00265-33.53-33.81.txt")
-    with open(problematic_file, "w") as f:
-        f.write("correct")
+    # problematic_file = os.path.join(data_dir, "fisher-2004-split-wav-sets", "train", "fe_03_00265-33.53-33.81.txt")
+    # with open(problematic_file, "w") as f:
+    #     f.write("correct")
 
     # Create train DataSet
     train = None
